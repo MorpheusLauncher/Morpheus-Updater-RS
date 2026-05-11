@@ -4,17 +4,31 @@ use eframe::egui;
 use futures_util::StreamExt;
 use reqwest::Client;
 use std::fs::File;
-use std::io::Read;
-use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Runtime;
 use zip::ZipArchive;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 const BETA: bool = true;
-const FILES: &[&str] = &["morpheus_win.zip", "Launcher.jar", "authlib-injector.jar"];
 const HOST: &str = "https://morpheuslauncher.it/downloads/";
 const VERSIONS_URL: &str = "https://morpheuslauncher.it/version.txt";
+
+#[cfg(windows)]
+const ZIP_NAME: &str = "morpheus_win.zip";
+#[cfg(unix)]
+const ZIP_NAME: &str = "morpheus_tux.zip";
+
+#[cfg(windows)]
+const LAUNCHER_EXE: &str = "morpheus_launcher_gui.exe";
+#[cfg(unix)]
+const LAUNCHER_EXE: &str = "morpheus_launcher_gui";
+
+const FILES: &[&str] = &[ZIP_NAME, "Launcher.jar", "authlib-injector.jar"];
 
 fn build_url(file: &str) -> String {
     if BETA {
@@ -82,7 +96,7 @@ async fn check_and_run(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let target_dir = get_morpheus_dir();
     let local_versions = target_dir.join("version.txt");
-    let launcher_path = target_dir.join("morpheus_launcher_gui.exe");
+    let launcher_path = target_dir.join(LAUNCHER_EXE);
 
     // Check if launcher and local version.txt exist
     let has_local_installation = launcher_path.exists() && local_versions.exists();
@@ -164,9 +178,19 @@ async fn check_and_run(
 
     // Launch launcher
     if launcher_path.exists() {
+        #[cfg(unix)]
+        {
+            check_and_install_dependencies(&logs).await?;
+            // Ensure executable permission
+            if let Ok(metadata) = std::fs::metadata(&launcher_path) {
+                let mut perms = metadata.permissions();
+                perms.set_mode(0o755);
+                let _ = std::fs::set_permissions(&launcher_path, perms);
+            }
+        }
         launch_and_exit(logs, &launcher_path, &target_dir).await?;
     } else {
-        log(&logs, "morpheus_launcher_gui.exe not found!".to_string());
+        log(&logs, format!("{} not found!", LAUNCHER_EXE));
     }
 
     Ok(())
@@ -186,6 +210,14 @@ async fn launch_and_exit(
             .args(&["/C", "start", "", launcher_path.to_str().unwrap()])
             .current_dir(target_dir)
             .creation_flags(0x08000000) // CREATE_NO_WINDOW
+            .spawn()?;
+    }
+
+    #[cfg(unix)]
+    {
+        // On Linux just spawn the process
+        std::process::Command::new(launcher_path)
+            .current_dir(target_dir)
             .spawn()?;
     }
 
@@ -293,6 +325,15 @@ fn extract_zip(zip_path: &std::path::Path) -> Result<(), Box<dyn std::error::Err
             }
             let mut outfile = File::create(&outpath)?;
             std::io::copy(&mut file, &mut outfile)?;
+
+            #[cfg(unix)]
+            {
+                if let Some(mode) = file.unix_mode() {
+                    let mut perms = std::fs::metadata(&outpath)?.permissions();
+                    perms.set_mode(mode);
+                    std::fs::set_permissions(&outpath, perms)?;
+                }
+            }
         }
     }
 
@@ -302,6 +343,274 @@ fn extract_zip(zip_path: &std::path::Path) -> Result<(), Box<dyn std::error::Err
 fn log(logs: &Arc<Mutex<String>>, msg: String) {
     let mut l = logs.lock().unwrap();
     l.push_str(&format!("{}\n", msg));
+}
+
+#[cfg(unix)]
+async fn check_and_install_dependencies(
+    logs: &Arc<Mutex<String>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    log(logs, "Checking system dependencies...".to_string());
+
+    let mut missing = Vec::new();
+
+    if !is_library_present("libsecret-1") {
+        missing.push("libsecret-1-0");
+    }
+
+    let has_jsoncpp = is_library_present("libjsoncpp");
+    if !has_jsoncpp {
+        missing.push("libjsoncpp-dev"); // or libjsoncpp25/26 depending on distro
+    }
+
+    if !missing.is_empty() {
+        log(
+            logs,
+            format!(
+                "Missing dependencies: {:?}. Attempting installation...",
+                missing
+            ),
+        );
+        install_packages(logs, &missing).await?;
+    }
+
+    // Handle libjsoncpp symlink if necessary
+    handle_jsoncpp_symlink(logs)?;
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn is_library_present(name: &str) -> bool {
+    let output = std::process::Command::new("ldconfig").arg("-p").output();
+
+    if let Ok(out) = output {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        stdout.contains(name)
+    } else {
+        // Fallback: check common paths
+        let paths = [
+            "/usr/lib",
+            "/usr/lib64",
+            "/lib/x86_64-linux-gnu",
+            "/usr/lib/x86_64-linux-gnu",
+        ];
+        for path in paths {
+            if let Ok(entries) = std::fs::read_dir(path) {
+                for entry in entries.flatten() {
+                    if let Some(filename) = entry.file_name().to_str() {
+                        if filename.contains(name) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+}
+
+#[cfg(unix)]
+async fn install_packages(
+    logs: &Arc<Mutex<String>>,
+    packages: &[&str],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let distro = get_linux_distro();
+    log(logs, format!("Detected distro: {}", distro));
+
+    let (cmd, args) = match distro.as_str() {
+        "ubuntu" | "debian" | "linuxmint" | "pop" => ("apt-get", vec!["install", "-y"]),
+        "fedora" | "centos" | "rhel" => ("dnf", vec!["install", "-y"]),
+        "arch" | "manjaro" => ("pacman", vec!["-S", "--noconfirm"]),
+        _ => {
+            log(logs, "Unsupported distribution for automatic installation. Please install dependencies manually.".to_string());
+            return Ok(());
+        }
+    };
+
+    let mut full_args = vec!["pkexec", cmd];
+    full_args.extend(args);
+    full_args.extend(packages);
+
+    log(logs, format!("Running: {:?}", full_args));
+
+    let status = std::process::Command::new(full_args[0])
+        .args(&full_args[1..])
+        .status()?;
+
+    if status.success() {
+        log(logs, "Dependencies installed successfully.".to_string());
+    } else {
+        log(
+            logs,
+            "Failed to install dependencies. You might need to install them manually.".to_string(),
+        );
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn get_linux_distro() -> String {
+    if let Ok(os_release) = std::fs::read_to_string("/etc/os-release") {
+        for line in os_release.lines() {
+            if line.starts_with("ID=") {
+                return line.trim_start_matches("ID=").trim_matches('"').to_string();
+            }
+        }
+    }
+    "unknown".to_string()
+}
+
+#[cfg(unix)]
+fn handle_jsoncpp_symlink(
+    logs: &Arc<Mutex<String>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let search_paths = [
+        "/usr/lib/x86_64-linux-gnu",
+        "/usr/lib64",
+        "/usr/lib",
+        "/lib/x86_64-linux-gnu",
+    ];
+    let available_versions = vec!["26", "25", "24", "11"];
+
+    let mut found_path = None;
+    let mut found_version = None;
+
+    'outer: for &path in &search_paths {
+        for &v in &available_versions {
+            let lib_path = format!("{}/libjsoncpp.so.{}", path, v);
+            if std::path::Path::new(&lib_path).exists() {
+                found_path = Some(path);
+                found_version = Some(v);
+                break 'outer;
+            }
+        }
+    }
+
+    if let (Some(path), Some(v)) = (found_path, found_version) {
+        log(logs, format!("Found libjsoncpp.so.{} in {}", v, path));
+
+        let other_v = if v == "25" {
+            "26"
+        } else if v == "26" {
+            "25"
+        } else {
+            ""
+        };
+        if !other_v.is_empty() {
+            let link_path = format!("{}/libjsoncpp.so.{}", path, other_v);
+            if !std::path::Path::new(&link_path).exists() {
+                log(
+                    logs,
+                    format!(
+                        "Creating compatibility symlink libjsoncpp.so.{} -> libjsoncpp.so.{}",
+                        other_v, v
+                    ),
+                );
+                let _ = std::process::Command::new("pkexec")
+                    .args(&["ln", "-s", &format!("libjsoncpp.so.{}", v), &link_path])
+                    .status();
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn ensure_self_relocation() -> Result<(), Box<dyn std::error::Error>> {
+    let current_exe = std::env::current_exe()?;
+    let target_dir = get_morpheus_dir();
+
+    // Create target dir if it doesn't exist
+    if !target_dir.exists() {
+        std::fs::create_dir_all(&target_dir)?;
+    }
+
+    // Check if we are already in the target dir
+    if current_exe.parent() == Some(&target_dir) {
+        return Ok(());
+    }
+
+    let target_exe = target_dir.join(current_exe.file_name().unwrap());
+
+    // Copy itself to target location
+    std::fs::copy(&current_exe, &target_exe)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&target_exe)?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&target_exe, perms)?;
+    }
+
+    // Launch the new copy
+    std::process::Command::new(target_exe).spawn()?;
+
+    // Create shortcut
+    if let Err(e) = create_shortcut() {
+        eprintln!("Shortcut creation error: {}", e);
+    }
+
+    // Exit current process
+    std::process::exit(0);
+}
+
+fn create_shortcut() -> Result<(), Box<dyn std::error::Error>> {
+    let target_dir = get_morpheus_dir();
+    let current_exe = std::env::current_exe()?;
+    let exe_name = current_exe.file_name().unwrap();
+    let target_exe = target_dir.join(exe_name);
+    let icon_path = target_dir.join("morpheus.ico");
+
+    // Ensure icon exists in .morpheus
+    if !icon_path.exists() {
+        let icon_bytes = include_bytes!("../morpheus.ico");
+        std::fs::write(&icon_path, icon_bytes)?;
+    }
+
+    #[cfg(windows)]
+    {
+        let desktop = dirs::desktop_dir().ok_or("Could not find desktop directory")?;
+        let lnk_path = desktop.join("Morpheus Launcher.lnk");
+
+        let script = format!(
+            "$s=(New-Object -COM WScript.Shell).CreateShortcut('{}');$s.TargetPath='{}';$s.IconLocation='{}';$s.Save()",
+            lnk_path.to_str().unwrap(),
+            target_exe.to_str().unwrap(),
+            icon_path.to_str().unwrap()
+        );
+
+        let _ = std::process::Command::new("powershell")
+            .args(&["-Command", &script])
+            .creation_flags(0x08000000) // CREATE_NO_WINDOW
+            .status();
+    }
+
+    #[cfg(unix)]
+    {
+        let home = dirs::home_dir().ok_or("Could not find home directory")?;
+        let apps_dir = home.join(".local/share/applications");
+        let _ = std::fs::create_dir_all(&apps_dir);
+
+        let desktop_file = apps_dir.join("morpheus-launcher.desktop");
+        let content = format!(
+            r#"[Desktop Entry]
+Type=Application
+Name=Morpheus Launcher
+Exec={}
+Icon={}
+Terminal=false
+Categories=Game;
+"#,
+            target_exe.to_str().unwrap(),
+            icon_path.to_str().unwrap()
+        );
+
+        std::fs::write(desktop_file, content)?;
+    }
+
+    Ok(())
 }
 
 fn load_icon() -> egui::IconData {
@@ -323,6 +632,11 @@ fn load_icon() -> egui::IconData {
 }
 
 fn main() {
+    // Relocation check
+    if let Err(e) = ensure_self_relocation() {
+        eprintln!("Relocation error: {}", e);
+    }
+
     let app_icon = load_icon();
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
