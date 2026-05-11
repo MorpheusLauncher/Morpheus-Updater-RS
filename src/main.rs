@@ -14,7 +14,7 @@ use std::os::unix::fs::PermissionsExt;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
-const BETA: bool = true;
+const BETA: bool = false;
 const HOST: &str = "https://morpheuslauncher.it/downloads/";
 const VERSIONS_URL: &str = "https://morpheuslauncher.it/version.txt";
 
@@ -27,6 +27,11 @@ const ZIP_NAME: &str = "morpheus_tux.zip";
 const LAUNCHER_EXE: &str = "morpheus_launcher_gui.exe";
 #[cfg(unix)]
 const LAUNCHER_EXE: &str = "morpheus_launcher_gui";
+
+#[cfg(windows)]
+const UPDATER_EXE: &str = "morpheus_updater.exe";
+#[cfg(unix)]
+const UPDATER_EXE: &str = "morpheus_updater";
 
 const FILES: &[&str] = &[ZIP_NAME, "Launcher.jar", "authlib-injector.jar"];
 
@@ -526,12 +531,12 @@ fn ensure_self_relocation() -> Result<(), Box<dyn std::error::Error>> {
         std::fs::create_dir_all(&target_dir)?;
     }
 
-    // Check if we are already in the target dir
-    if current_exe.parent() == Some(&target_dir) {
+    let target_exe = target_dir.join(UPDATER_EXE);
+
+    // Check if we are already in the target dir and have the right name
+    if current_exe == target_exe {
         return Ok(());
     }
-
-    let target_exe = target_dir.join(current_exe.file_name().unwrap());
 
     // Copy itself to target location
     std::fs::copy(&current_exe, &target_exe)?;
@@ -558,9 +563,7 @@ fn ensure_self_relocation() -> Result<(), Box<dyn std::error::Error>> {
 
 fn create_shortcut() -> Result<(), Box<dyn std::error::Error>> {
     let target_dir = get_morpheus_dir();
-    let current_exe = std::env::current_exe()?;
-    let exe_name = current_exe.file_name().unwrap();
-    let target_exe = target_dir.join(exe_name);
+    let target_exe = target_dir.join(UPDATER_EXE);
     let icon_path = target_dir.join("morpheus.ico");
 
     // Ensure icon exists in .morpheus
