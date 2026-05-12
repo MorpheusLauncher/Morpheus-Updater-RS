@@ -356,15 +356,24 @@ async fn check_and_install_dependencies(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     log(logs, "Checking system dependencies...".to_string());
 
+    let distro = get_linux_distro();
+    log(logs, format!("Detected distro: {}", distro));
+
     let mut missing = Vec::new();
 
+    // Map library names to package names based on distro
+    let (secret_pkg, json_pkg) = match distro.as_str() {
+        "fedora" | "centos" | "rhel" => ("libsecret", "jsoncpp"),
+        "arch" | "manjaro" => ("libsecret", "jsoncpp"),
+        _ => ("libsecret-1-0", "libjsoncpp-dev"), // Ubuntu/Debian default
+    };
+
     if !is_library_present("libsecret-1") {
-        missing.push("libsecret-1-0");
+        missing.push(secret_pkg);
     }
 
-    let has_jsoncpp = is_library_present("libjsoncpp");
-    if !has_jsoncpp {
-        missing.push("libjsoncpp-dev"); // or libjsoncpp25/26 depending on distro
+    if !is_library_present("libjsoncpp") {
+        missing.push(json_pkg);
     }
 
     if !missing.is_empty() {
@@ -386,24 +395,24 @@ async fn check_and_install_dependencies(
 
 #[cfg(unix)]
 fn is_library_present(name: &str) -> bool {
-    let output = std::process::Command::new("ldconfig").arg("-p").output();
+    let mut output = std::process::Command::new("ldconfig").arg("-p").output();
+    if output.is_err() {
+        output = std::process::Command::new("/sbin/ldconfig")
+            .arg("-p")
+            .output();
+    }
 
     if let Ok(out) = output {
         let stdout = String::from_utf8_lossy(&out.stdout);
         stdout.contains(name)
     } else {
-        // Fallback: check common paths
-        let paths = [
-            "/usr/lib",
-            "/usr/lib64",
-            "/lib/x86_64-linux-gnu",
-            "/usr/lib/x86_64-linux-gnu",
-        ];
-        for path in paths {
-            if let Ok(entries) = std::fs::read_dir(path) {
+        // Fallback: search in common library directories if ldconfig fails
+        let common_dirs = ["/usr/lib", "/usr/lib64", "/lib", "/lib64"];
+        for dir in common_dirs {
+            if let Ok(entries) = std::fs::read_dir(dir) {
                 for entry in entries.flatten() {
-                    if let Some(filename) = entry.file_name().to_str() {
-                        if filename.contains(name) {
+                    if let Some(file_name) = entry.file_name().to_str() {
+                        if file_name.contains(name) {
                             return true;
                         }
                     }
@@ -420,7 +429,6 @@ async fn install_packages(
     packages: &[&str],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let distro = get_linux_distro();
-    log(logs, format!("Detected distro: {}", distro));
 
     let (cmd, args) = match distro.as_str() {
         "ubuntu" | "debian" | "linuxmint" | "pop" => ("apt-get", vec!["install", "-y"]),
@@ -470,52 +478,118 @@ fn get_linux_distro() -> String {
 fn handle_jsoncpp_symlink(
     logs: &Arc<Mutex<String>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let search_paths = [
-        "/usr/lib/x86_64-linux-gnu",
-        "/usr/lib64",
-        "/usr/lib",
-        "/lib/x86_64-linux-gnu",
-    ];
-    let available_versions = vec!["26", "25", "24", "11"];
+    log(
+        logs,
+        "Searching for libjsoncpp for compatibility symlinks...".to_string(),
+    );
 
-    let mut found_path = None;
-    let mut found_version = None;
-
-    'outer: for &path in &search_paths {
-        for &v in &available_versions {
-            let lib_path = format!("{}/libjsoncpp.so.{}", path, v);
-            if std::path::Path::new(&lib_path).exists() {
-                found_path = Some(path);
-                found_version = Some(v);
-                break 'outer;
-            }
-        }
+    let mut output = std::process::Command::new("ldconfig").arg("-p").output();
+    if output.is_err() {
+        output = std::process::Command::new("/sbin/ldconfig")
+            .arg("-p")
+            .output();
     }
 
-    if let (Some(path), Some(v)) = (found_path, found_version) {
-        log(logs, format!("Found libjsoncpp.so.{} in {}", v, path));
+    let mut found_libs = Vec::new();
 
-        let other_v = if v == "25" {
-            "26"
-        } else if v == "26" {
-            "25"
-        } else {
-            ""
-        };
-        if !other_v.is_empty() {
-            let link_path = format!("{}/libjsoncpp.so.{}", path, other_v);
-            if !std::path::Path::new(&link_path).exists() {
-                log(
+    if let Ok(out) = output {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        for line in stdout.lines() {
+            if line.contains("libjsoncpp.so.") {
+                log(logs, format!("ldconfig match: {}", line.trim()));
+                if let Some(pos) = line.rfind("=> ") {
+                    let full_path_str = line[pos + 3..].trim();
+                    let path = std::path::PathBuf::from(full_path_str);
+                    if path.exists() {
+                        if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
+                            if let Some(version) = file_name.strip_prefix("libjsoncpp.so.") {
+                                if let Some(parent) = path.parent() {
+                                    found_libs.push((parent.to_path_buf(), version.to_string()));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        log(
+            logs,
+            "Could not run ldconfig to find libraries.".to_string(),
+        );
+    }
+
+    if found_libs.is_empty() {
+        log(
+            logs,
+            "No libjsoncpp version found via ldconfig.".to_string(),
+        );
+        return Ok(());
+    }
+
+    // Ordina per versione (priorità alla più recente)
+    found_libs.sort_by(|a, b| b.1.cmp(&a.1));
+
+    let (dir, v) = &found_libs[0];
+    log(
+        logs,
+        format!(
+            "Using libjsoncpp.so.{} from {} for symlinks",
+            v,
+            dir.display()
+        ),
+    );
+
+    // Versioni di compatibilità che vogliamo assicurarci esistano
+    let targets = ["24", "25", "26"];
+
+    for target_v in targets {
+        // Se la versione trovata inizia con target_v (es. v="25" e target="25"), saltiamo
+        if v.starts_with(target_v)
+            && (v.len() == target_v.len() || v.as_bytes()[target_v.len()] == b'.')
+        {
+            continue;
+        }
+
+        let target_path = dir.join(format!("libjsoncpp.so.{}", target_v));
+        if !target_path.exists() {
+            log(
+                logs,
+                format!(
+                    "Creating compatibility symlink libjsoncpp.so.{} -> libjsoncpp.so.{}",
+                    target_v, v
+                ),
+            );
+
+            let status = std::process::Command::new("pkexec")
+                .args(&[
+                    "ln",
+                    "-s",
+                    &format!("libjsoncpp.so.{}", v),
+                    target_path.to_str().unwrap(),
+                ])
+                .status();
+
+            match status {
+                Ok(s) if s.success() => log(
+                    logs,
+                    format!("Successfully created symlink libjsoncpp.so.{}", target_v),
+                ),
+                Ok(s) => log(
                     logs,
                     format!(
-                        "Creating compatibility symlink libjsoncpp.so.{} -> libjsoncpp.so.{}",
-                        other_v, v
+                        "Failed to create symlink libjsoncpp.so.{} (exit code: {:?})",
+                        target_v,
+                        s.code()
                     ),
-                );
-                let _ = std::process::Command::new("pkexec")
-                    .args(&["ln", "-s", &format!("libjsoncpp.so.{}", v), &link_path])
-                    .status();
+                ),
+                Err(e) => log(logs, format!("Error running pkexec for symlink: {}", e)),
             }
+        } else {
+            log(
+                logs,
+                format!("Symlink or file libjsoncpp.so.{} already exists.", target_v),
+            );
         }
     }
 
